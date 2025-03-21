@@ -59,6 +59,16 @@ if not vim.loop.fs_stat(lazypath) then
   }
 end
 vim.opt.rtp:prepend(lazypath)
+vim.opt.spelllang = 'en_us'
+vim.opt.spell = true
+
+local prefix = vim.env.XDG_CONFIG_HOME or vim.fn.expand("~/.config")
+
+vim.opt.undodir = { prefix .. "/nvim/.undo//"}
+
+vim.opt.backupdir = {prefix .. "/nvim/.backup//"}
+
+vim.opt.directory = { prefix .. "/nvim/.swp//"}
 
 -- [[ Configure plugins ]]
 -- NOTE: Here is where you install your plugins.
@@ -486,9 +496,34 @@ vim.defer_fn(function()
   }
 end, 0)
 
+-- Helper function to manually stop unwanted language servers in Deno projects
+local function force_stop_ts_servers_for_deno(bufnr)
+  local fname = vim.api.nvim_buf_get_name(bufnr or 0)
+  if require('lspconfig').util.root_pattern("deno.json", "deno.jsonc")(fname) then
+    -- We're in a Deno project, stop any non-Deno TS servers
+    for _, client in pairs(vim.lsp.get_clients({bufnr = bufnr})) do
+      if client.name ~= "denols" and (
+         client.name == "tsserver" or 
+         client.name == "typescript" or
+         client.name == "ts_ls" or
+         client.name == "volar" or
+         client.name == "eslint") then
+        client.stop()
+        vim.notify("Force-stopped " .. client.name .. " in Deno project", vim.log.levels.INFO)
+      end
+    end
+  end
+end
+
+-- Create a command to manually force stop unwanted servers
+vim.api.nvim_create_user_command('ForceStopTsServers', function()
+  force_stop_ts_servers_for_deno()
+  vim.notify("Manually stopped non-Deno language servers", vim.log.levels.INFO)
+end, { desc = 'Force stop non-Deno TS language servers' })
+
 -- [[ Configure LSP ]]
 --  This function gets run when an LSP connects to a particular buffer.
-local on_attach = function(_, bufnr)
+local on_attach = function(client, bufnr)
   -- NOTE: Remember that lua is a real programming language, and as such it is possible
   -- to define small helper and utility functions so you don't have to repeat yourself
   -- many times.
@@ -526,27 +561,51 @@ local on_attach = function(_, bufnr)
   end, '[W]orkspace [L]ist Folders')
 
   -- Create a command `:Format` local to the LSP buffer
-  --vim.api.nvim_buf_create_user_command(bufnr, 'Format', function(_)
-  --  vim.lsp.buf.format()
-  --end, { desc = 'Format current buffer with LSP' })
+  vim.api.nvim_buf_create_user_command(bufnr, 'Format', function(_)
+    vim.lsp.buf.format()
+  end, { desc = 'Format current buffer with LSP' })
+
+  -- For Deno projects, we want to force-stop non-Deno servers immediately
+  force_stop_ts_servers_for_deno(bufnr)
+  
+  -- If the client is denols, stop other TS servers
+  if client.name == "denols" then
+    local active_clients = vim.lsp.get_clients({bufnr = bufnr})
+    for _, client_ in pairs(active_clients) do
+      if client_.id ~= client.id and (
+         client_.name == "tsserver" or
+         client_.name == "typescript" or 
+         client_.name == "ts_ls" or
+         client_.name == "volar" or
+         client_.name == "eslint") then
+        client_.stop()
+        vim.notify("Stopped " .. client_.name .. " when Deno LSP attached", vim.log.levels.INFO)
+      end
+    end
+  end
 end
 
 -- document existing key chains
-require('which-key').register {
-  ['<leader>c'] = { name = '[C]ode', _ = 'which_key_ignore' },
-  ['<leader>g'] = { name = '[G]it', _ = 'which_key_ignore' },
-  ['<leader>h'] = { name = 'Git [H]unk', _ = 'which_key_ignore' },
-  ['<leader>r'] = { name = '[R]ename', _ = 'which_key_ignore' },
-  ['<leader>s'] = { name = '[S]earch', _ = 'which_key_ignore' },
-  ['<leader>t'] = { name = '[T]oggle', _ = 'which_key_ignore' },
-  ['<leader>w'] = { name = '[W]orkspace', _ = 'which_key_ignore' },
-}
--- register which-key VISUAL mode
--- required for visual <leader>hs (hunk stage) to work
-require('which-key').register({
-  ['<leader>'] = { name = 'VISUAL <leader>' },
-  ['<leader>h'] = { 'Git [H]unk' },
-}, { mode = 'v' })
+require('which-key').add(
+  {
+    { "<leader>c", group = "[C]ode" },
+    { "<leader>c_", hidden = true },
+    { "<leader>g", group = "[G]it" },
+    { "<leader>g_", hidden = true },
+    { "<leader>h", group = "Git [H]unk" },
+    { "<leader>h_", hidden = true },
+    { "<leader>r", group = "[R]ename" },
+    { "<leader>r_", hidden = true },
+    { "<leader>s", group = "[S]earch" },
+    { "<leader>s_", hidden = true },
+    { "<leader>t", group = "[T]oggle" },
+    { "<leader>t_", hidden = true },
+    { "<leader>w", group = "[W]orkspace" },
+    { "<leader>w_", hidden = true },
+    { "<leader>", group = "VISUAL <leader>", mode = "v" },
+    { "<leader>h", desc = "Git [H]unk", mode = "v" },
+  }
+)
 
 -- mason-lspconfig requires that these setup functions are called in this order
 -- before setting up the servers.
@@ -561,15 +620,36 @@ require('mason-lspconfig').setup()
 --
 --  If you want to override the default filetypes that your language server will attach to you can
 --  define the property 'filetypes' to the map in question.
+
 local servers = {
   -- clangd = {},
   -- gopls = {},
-  -- pyright = {},
+  pyright = {},
   rust_analyzer = {},
-  tsserver = {},
-  volar = {},
+  -- Official typescript server
+  tsserver = {
+    filetypes = { 'typescript', 'javascript', 'javascriptreact', 'typescriptreact', 'vue' },
+  },
+  -- Alternative typescript server (appears in your LspInfo as ts_ls)
+  typescript = {
+    filetypes = { 'typescript', 'javascript', 'javascriptreact', 'typescriptreact' },
+  },
+  -- eslint = {
+  --   workingDirectory = { mode = 'location' },
+  -- },
+  denols = {
+    filetypes = { "javascript", "javascriptreact", "javascript.jsx", "typescript", "typescriptreact", "typescript.tsx", "json", "jsonc" },
+  },
+  --volar = {
+  --  filetypes = { 'typescript', 'javascript', 'javascriptreact', 'typescriptreact', 'vue' },
+  --  -- root_dir = require('lspconfig').util.root_pattern("src/App.vue"),
+  --  init_options = {
+  --    vue = {
+  --      hybridMode = true,
+  --    },
+  --  },
+  --},
   html = { filetypes = { 'html', 'twig', 'hbs' } },
-
   lua_ls = {
     Lua = {
       workspace = { checkThirdParty = false },
@@ -594,14 +674,142 @@ mason_lspconfig.setup {
   ensure_installed = vim.tbl_keys(servers),
 }
 
+-- Create autocommand group for our Deno-related commands
+local deno_augroup = vim.api.nvim_create_augroup('denols_force_stop', { clear = true })
+
+-- Add autocmd to force stop non-Deno servers when entering a buffer
+vim.api.nvim_create_autocmd('BufEnter', {
+  group = deno_augroup,
+  callback = function(args)
+    -- Small delay to ensure all servers have had a chance to attach
+    vim.defer_fn(function()
+      force_stop_ts_servers_for_deno(args.buf)
+    end, 100)
+  end,
+})
+
+-- Helper function to check if in a Deno project
+local function is_deno_project(fname)
+  local deno_root = require('lspconfig').util.root_pattern("deno.json", "deno.jsonc")(fname)
+  return deno_root ~= nil
+end
+
 mason_lspconfig.setup_handlers {
   function(server_name)
-    require('lspconfig')[server_name].setup {
-      capabilities = capabilities,
-      on_attach = on_attach,
-      settings = servers[server_name],
-      filetypes = (servers[server_name] or {}).filetypes,
-    }
+    if server_name == "denols" then
+      require('lspconfig')[server_name].setup {
+        capabilities = capabilities,
+        on_attach = on_attach,
+        settings = servers[server_name],
+        filetypes = (servers[server_name] or {}).filetypes,
+        root_dir = require('lspconfig').util.root_pattern("deno.json", "deno.jsonc"),
+        -- This will prevent other TS LSP servers from starting when denols is active
+        single_file_support = false,
+      }
+    elseif server_name == "tsserver" then
+      require('lspconfig')[server_name].setup {
+        capabilities = capabilities,
+        on_attach = function(client, bufnr)
+          -- Check if we're in a Deno project, if so stop the client immediately
+          local fname = vim.api.nvim_buf_get_name(bufnr)
+          if is_deno_project(fname) then
+            client.stop()
+            vim.notify("Prevented tsserver in Deno project", vim.log.levels.INFO)
+            return
+          end
+          on_attach(client, bufnr)
+        end,
+        settings = servers[server_name],
+        filetypes = (servers[server_name] or {}).filetypes,
+        -- Explicitly avoid attaching in Deno projects
+        root_dir = function(fname)
+          if is_deno_project(fname) then
+            return nil -- Don't attach tsserver in Deno projects
+          end
+          return require('lspconfig').util.root_pattern("package.json", "tsconfig.json", "jsconfig.json")(fname)
+        end,
+      }
+    elseif server_name == "typescript" or server_name == "ts_ls" then
+      require('lspconfig')[server_name].setup {
+        capabilities = capabilities,
+        on_attach = function(client, bufnr)
+          -- Check if we're in a Deno project, if so stop the client immediately
+          local fname = vim.api.nvim_buf_get_name(bufnr)
+          if is_deno_project(fname) then
+            client.stop()
+            vim.notify("Prevented ts_ls in Deno project", vim.log.levels.INFO)
+            return
+          end
+          on_attach(client, bufnr)
+        end,
+        settings = servers[server_name],
+        filetypes = (servers[server_name] or {}).filetypes,
+        -- Explicitly avoid attaching in Deno projects
+        root_dir = function(fname)
+          if is_deno_project(fname) then
+            return nil -- Don't attach typescript/ts_ls in Deno projects
+          end
+          return require('lspconfig').util.root_pattern("package.json", "tsconfig.json", "jsconfig.json")(fname)
+        end,
+      }
+    elseif server_name == "volar" then
+      require('lspconfig')[server_name].setup {
+        capabilities = capabilities,
+        on_attach = function(client, bufnr)
+          -- Check if we're in a Deno project, if so stop the client immediately
+          local fname = vim.api.nvim_buf_get_name(bufnr)
+          if is_deno_project(fname) then
+            client.stop()
+            vim.notify("Prevented volar in Deno project", vim.log.levels.INFO)
+            return
+          end
+          on_attach(client, bufnr)
+        end,
+        settings = servers[server_name],
+        filetypes = (servers[server_name] or {}).filetypes,
+        init_options = {
+          vue = {
+            hybridMode = true,
+          },
+        },
+        -- Explicitly avoid attaching in Deno projects
+        root_dir = function(fname)
+          if is_deno_project(fname) then
+            return nil -- Don't attach volar in Deno projects
+          end
+          return require('lspconfig').util.root_pattern("package.json")(fname)
+        end,
+      }
+    elseif server_name == "eslint" then
+      require('lspconfig')[server_name].setup {
+        capabilities = capabilities,
+        on_attach = function(client, bufnr)
+          -- Check if we're in a Deno project, if so stop the client immediately
+          local fname = vim.api.nvim_buf_get_name(bufnr)
+          if is_deno_project(fname) then
+            client.stop()
+            vim.notify("Prevented eslint in Deno project", vim.log.levels.INFO)
+            return
+          end
+          on_attach(client, bufnr)
+        end,
+        settings = servers[server_name],
+        -- Explicitly avoid attaching in Deno projects
+        root_dir = function(fname)
+          if is_deno_project(fname) then
+            return nil -- Don't attach eslint in Deno projects
+          end
+          return require('lspconfig').util.root_pattern(".eslintrc.js", ".eslintrc.cjs", ".eslintrc.yaml", ".eslintrc.yml", ".eslintrc.json")(fname)
+        end,
+      }
+    else
+      require('lspconfig')[server_name].setup {
+        capabilities = capabilities,
+        on_attach = on_attach,
+        settings = servers[server_name],
+        filetypes = (servers[server_name] or {}).filetypes,
+      }
+    end
   end,
 }
 
